@@ -44,7 +44,14 @@ const RECONCILE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 const stateDir = process.env.HERDR_PLUGIN_STATE_DIR || ".";
 fs.mkdirSync(stateDir, { recursive: true });
-const lockPath = path.join(stateDir, "watcher.lock");
+// Use an atomic {mkdir → write pid file} pair instead of a single file
+// write with "wx": on Windows, the OS-level locking semantics of "wx" can
+// let multiple processes successfully create the same file in close
+// succession (observed empirically - 4 watcher.mjs processes ran
+// simultaneously despite the "wx" lock). mkdir is guaranteed atomic by the
+// OS: at most one contender wins, everyone else gets EEXIST.
+const lockDir = path.join(stateDir, "watcher.lock");
+const lockPidFile = path.join(lockDir, "pid");
 
 // pane_id -> { shellPid, opencodePid, reporting: bool, lastState: "idle"|"working"|null, addedAt, terminalId }
 const watched = new Map();
@@ -76,19 +83,22 @@ const baselinePids = new Set();
 // then frozen into baselinePids for good - see pollOnce().
 let firstTickDone = false;
 
-// opencode.exe pids that once legitimately belonged to a pane whose
-// tracking we later tore down (the pane closed, or its underlying Herdr
-// terminal got recreated - see terminalId handling in refreshWatchList).
-// Permanently excluded from unclaimedPool: without a working ancestry walk,
-// elimination-matching has NO way to verify a pid actually belongs to a
-// given pane, it just infers it from "currently unclaimed and alive". A pid
-// freed up by one pane closing is NOT fair game for some other pane that
-// happens to be pending at the same moment - that caused exactly this bug:
-// closing the ORIGINAL "digex-17498" pane freed its still-alive (MSYS
+// opencode.exe pids that once legitimately belonged to a pane that was
+// CLOSED (not just terminal-recreated). Permanently excluded from
+// unclaimedPool: closing the original pane freed its still-alive (MSYS
 // orphaned, never actually reaped) opencode.exe pid back into the pool,
 // which then got wrongly assigned to a completely different, actually-
-// blank pane the next time reconciliation ran.
+// blank pane. By contrast, a terminal CHANGE (recreated Herdr pty while
+// the pane_id stays the same) does NOT retire the pid - the same opencode
+// process is still running behind the new terminal, and re-matching it
+// against the re-added pane is both safe and necessary. A pid that enters
+// retiredPids and then its process dies is pruned automatically during
+// periodic maintenance.
 const retiredPids = new Set();
+// Tracks Date.now() of last retiredPids sweep to avoid calling
+// isPidAlive in every single tick.
+let lastRetireSweep = 0;
+const RETIRE_SWEEP_INTERVAL_MS = 90_000; // purge dead entries every 90s
 
 function isPidAlive(pid) {
   const res = spawnSync("powershell", [
@@ -99,46 +109,54 @@ function isPidAlive(pid) {
 }
 
 function tryAcquireSingletonLock() {
-  // Atomic exclusive-create ("wx") instead of existsSync-then-writeFileSync:
-  // the latter is a classic TOCTOU race - two watcher.mjs processes spawned
-  // within the same instant (e.g. two workspace.focused events firing back
-  // to back for two different panes) can both pass the existsSync check
-  // before either writes, so both "win" and run as duplicate singletons.
-  // Duplicates are worse than a missed poll: each keeps its own independent
-  // watched/claimedPids state, so two live watchers can each believe a pid
-  // is unclaimed and assign it to two different panes. Loop on EEXIST so a
-  // stale lock (owner dead) gets reclaimed by exactly one contender.
+  // Atomic directory creation (mkdir). Windows guarantees only one
+  // contender wins - everyone else gets EEXIST. Once the directory is ours,
+  // write the pid file inside it so other contenders can verify liveness.
   for (;;) {
     try {
-      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
-      return true; // we created it fresh - we own the lock
+      fs.mkdirSync(lockDir);
+      try {
+        fs.writeFileSync(lockPidFile, String(process.pid));
+      } catch {
+        // non-fatal: pid file inside our own dir shouldn't fail
+      }
+      return true;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
     }
 
+    // Another watcher owns the directory. Read its pid to check liveness.
     let prevPid = null;
     try {
-      prevPid = parseInt(fs.readFileSync(lockPath, "utf8").trim(), 10);
+      prevPid = parseInt(fs.readFileSync(lockPidFile, "utf8").trim(), 10);
     } catch {
-      continue; // lock vanished between our failed create and this read - retry
+      // pid file missing or unreadable - stale lock, remove dir and retry
+      try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+      continue;
     }
     if (prevPid && isPidAlive(prevPid)) {
       return false; // another watcher is genuinely running
     }
-    // Stale lock (owner dead) - try to reclaim it. If another contender
-    // beats us to the recreate, our next "wx" attempt above will fail with
-    // EEXIST again and we'll re-check its (now-live) owner and back off.
-    try {
-      fs.unlinkSync(lockPath);
-    } catch {
-      // already removed/replaced by another contender - loop and re-check
-    }
+    // Stale lock (owner dead). Remove the directory and retry the mkdir.
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
   }
 }
 
 if (!tryAcquireSingletonLock()) {
   process.exit(0);
 }
+
+// Clean up the lock directory on exit so the next process doesn't find a
+// stale lock and need to verify liveness. Important: there's no signal that
+// Herdr sends to a plugin before terminating the process (no SIGTERM on
+// Windows), so this is best-effort only - a stale-lock fallback is still
+// needed in tryAcquireSingletonLock() for the crash/force-kill case.
+function releaseLock() {
+  try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+}
+process.on("exit", releaseLock);
+process.on("SIGINT", () => { releaseLock(); process.exit(0); });
+process.on("SIGTERM", () => { releaseLock(); process.exit(0); });
 
 function classifyPane(pane) {
   const info = paneProcessInfo(pane.pane_id);
@@ -178,7 +196,16 @@ function refreshWatchList() {
     const terminalChanged = existing != null && existing.terminalId !== pane.terminal_id;
     if (terminalChanged) {
       if (existing.reporting) releaseAgent(pane.pane_id);
-      if (existing.opencodePid != null) retiredPids.add(existing.opencodePid);
+      // NOTE: intentionally NOT adding existing.opencodePid to retiredPids
+      // here. A terminal recreation (new Herdr pty) does NOT mean the
+      // opencode.exe process behind it has changed - the same process is
+      // still running in the new terminal. If we retired the pid here, it
+      // could never re-enter the unclaimed pool to match the re-added pane,
+      // locking it out permanently. That bug was observed in production: a
+      // mass terminal recreation (e.g. Herdr reloading all sessions)
+      // retired EVERY pane's opencodePid simultaneously, leaving zero live
+      // pids eligible for the pool, and ALL panes stayed unknown until the
+      // watcher was restarted.
       watched.delete(pane.pane_id);
     } else if (existing) {
       continue;
@@ -319,6 +346,20 @@ function pollOnce() {
     for (const pid of unclaimedPool.keys()) baselinePids.add(pid);
     unclaimedPool.clear();
     firstTickDone = true;
+  }
+
+  // Periodic retiredPids purging: once every ~90s, drop entries whose
+  // process has died. Without this, a retired pid whose original pane
+  // closed remains permanently excluded from the pool even after the
+  // underlying process has been naturally reaped - harmless but wastes a
+  // tiny amount of memory. More importantly, a still-alive orphan keeps
+  // a slot forever; if it's still running after days it's an MSYS zombie
+  // that should stay excluded, so we only prune dead entries.
+  if (Date.now() - lastRetireSweep > RETIRE_SWEEP_INTERVAL_MS) {
+    for (const pid of [...retiredPids]) {
+      if (!isPidAlive(pid)) retiredPids.delete(pid);
+    }
+    lastRetireSweep = Date.now();
   }
 
   for (const [paneId, w] of watched) {
